@@ -86,6 +86,8 @@ static inline bool nn_can_slider_threat(int pc, int slider) {
 // our numbering group c is the squares 16c..16c+15, contiguous in the mailbox too.
 template <int SqShift, int PcShift, typename Look>
 static inline void nn_write_multi(const Look &look, U64 mask, std::uint32_t tmpl, NnDirtyThreats *dts) {
+  if (!mask)
+    return;
   std::uint32_t *write = dts->list + dts->n;
   dts->n += count_bits(mask);
   alignas(64) static constexpr std::uint32_t lane[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
@@ -93,6 +95,8 @@ static inline void nn_write_multi(const Look &look, U64 mask, std::uint32_t tmpl
   const __m512i template_v = _mm512_set1_epi32(int(tmpl));
   for (int c = 0; c < 4; c++) {
     const __mmask16 m = __mmask16(mask >> (16 * c));
+    if (!m)
+      continue;
     const __m512i pieces = _mm512_slli_epi32(look.chunk(c), PcShift);
     const __m512i squares = _mm512_slli_epi32(_mm512_add_epi32(lanev, _mm512_set1_epi32(16 * c)), SqShift);
     const __m512i dirties = _mm512_ternarylogic_epi32(template_v, squares, pieces, 254 /* A | B | C */);
@@ -483,7 +487,8 @@ static inline void nn_dirty_catch_up(ThreadData &td) {
     NnState &st = S.st[i];
     nn_fill_pawns(st.pawns, st.dp, tb.type[NN_PAWN] & tb.color[white], tb.type[NN_PAWN] & tb.color[black]);
     nn_threat_steps(tb, NnLookMailbox{mb}, st.dp, &st.threats);  // tb leaves in the state after the move
-    nn_mb_redo(mb, st.dp);
+    if (i + 1 < last)
+      nn_mb_redo(mb, st.dp);
     if (st.pawns.any) {  // R4: the passers change only with a pawn event
       const U64 wp = tb.type[NN_PAWN] & tb.color[white], bp = tb.type[NN_PAWN] & tb.color[black];
       v1w = nn_passers(white, wp, bp);

@@ -1234,9 +1234,8 @@ inline void act16(__m512i x, int cut, int sqShift, int vShift, __m128i& sq, __m1
     val = _mm512_cvtepi32_epi8(v);
 }
 
-CN_LEAF Out forward_tail_simd(const Stack& st, const std::int32_t* x1, const Acc& us, const Acc& them, int bucket) {
+CN_LEAF Out forward_tail_simd(const Stack& st, __m512i x1lo, __m512i x1hi, const Acc& us, const Acc& them, int bucket) {
     alignas(64) std::uint8_t a1[2 * L2], a2[2 * L3];
-    const __m512i x1lo = _mm512_load_si512(x1), x1hi = _mm512_load_si512(x1 + 16);
     __m128i q0, v0, q1, v1;
     act16(x1lo, 16383, 21, 7, q0, v0);
     act16(x1hi, 16383, 21, 7, q1, v1);
@@ -1263,7 +1262,8 @@ CN_LEAF Out forward_tail_simd(const Stack& st, const std::int32_t* x1, const Acc
     __m512i o = dot4(_mm512_setzero_si512(), _mm512_load_si512(a1), _mm512_loadu_si512(st.w3));
     o = dot4(o, _mm512_load_si512(a2), _mm512_loadu_si512(st.w3 + 2 * L2));
     const std::int32_t out  = st.b3 + _mm512_reduce_add_epi32(o);
-    const std::int32_t skip = x1[L2 - 2] - x1[L2 - 1];
+    const __m128i      hi3  = _mm512_extracti32x4_epi32(x1hi, 3);
+    const std::int32_t skip = _mm_extract_epi32(hi3, 2) - _mm_extract_epi32(hi3, 3);
     Out r;
     r.positional = int((std::int64_t(out) + skip) * 600 / 16384);
     r.psqt       = (us.psqt[bucket] - them.psqt[bucket]) / 32;
@@ -1345,11 +1345,13 @@ CN_LEAF Out forward_simd(const Net& net, const Acc& us, const Acc& them, int buc
         a0 = dot4(a0, x, _mm512_load_si512(w));
         a1 = dot4(a1, x, _mm512_load_si512(w + 1));
     }
-    alignas(64) std::int32_t x1loc[L2];
-    std::int32_t* x1 = x1out ? x1out : x1loc;   // x1out is 64-byte aligned (Handle::x1)
-    _mm512_store_si512(x1, _mm512_add_epi32(a0, a2));
-    _mm512_store_si512(x1 + 16, _mm512_add_epi32(a1, a3));
-    return forward_tail_simd(st, x1, us, them, bucket);
+    const __m512i x1lo = _mm512_add_epi32(a0, a2);
+    const __m512i x1hi = _mm512_add_epi32(a1, a3);
+    if (x1out) {
+        _mm512_store_si512(x1out, x1lo);
+        _mm512_store_si512(x1out + 16, x1hi);
+    }
+    return forward_tail_simd(st, x1lo, x1hi, us, them, bucket);
 }
 #elif defined(USE_AVX2)
 // AVX2 (block 7 of 8.1, 18/10/2026: brought level with the AVX-512 path). Same steps: l0 kept in the order packus
@@ -1439,10 +1441,9 @@ CN_LEAF Out forward_tail_avx2(const Stack& st, const __m256i* x1, const Acc& us,
     __m128i s = _mm_add_epi32(_mm256_castsi256_si128(o), _mm256_extracti128_si256(o, 1));
     s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
     s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
-    alignas(32) std::int32_t x1s[L2];
-    _mm256_store_si256((__m256i*)(x1s + 24), x1[3]);
+    const __m128i      hi3  = _mm256_extracti128_si256(x1[3], 1);
     const std::int32_t out  = st.b3 + _mm_cvtsi128_si32(s);
-    const std::int32_t skip = x1s[L2 - 2] - x1s[L2 - 1];
+    const std::int32_t skip = _mm_extract_epi32(hi3, 2) - _mm_extract_epi32(hi3, 3);
     Out r;
     r.positional = int((std::int64_t(out) + skip) * 600 / 16384);
     r.psqt       = (us.psqt[bucket] - them.psqt[bucket]) / 32;
@@ -2151,14 +2152,12 @@ void apply_refresh(const RowList& LH, const RowList& LO, Acc& entry, Acc& dst, c
     refresh_tile<true>(LH, LO, entry, dst, 0, pv);
     refresh_tile<false>(LH, LO, entry, dst, L1 / 2, pv);
 }
-#define CN_PAWN_CACHE 1   // the refresh above takes the pawn vector (AVX-512 only for now)
-#elif defined(USE_AVX2) && defined(CN_AVX2_FUSED)
-// -DCN_AVX2_FUSED (21/10/2026; OFF by default): the single-pass refresh and king step in the AVX2 builds as well
-// (Intel hybrid processors with AVX-VNNI, Zen 3, Zen 1/2), eight tiles of 8 registers. Without it a refresh is two
-// whole passes of apply and a king step three, plus a loop over the 1024 values for S(parent) - entry + entry and a
-// 2 KB accumulator on the stack. The same integer operations in the same order per value, so the same accumulators.
+#define CN_PAWN_CACHE 1
+#elif defined(USE_AVX2) && !defined(CN_NO_AVX2_FUSED)
+// Single-pass refresh and king step in the AVX2 builds (Intel hybrid processors with AVX-VNNI, Zen 3, Zen 1/2),
+// eight tiles of 8 registers, with pawn cache support (pv).
 template <bool WithPsqt>
-inline void refresh_tile(const RowList& LH, const RowList& LO, Acc& entry, Acc& dst, int t) {
+inline void refresh_tile(const RowList& LH, const RowList& LO, Acc& entry, Acc& dst, int t, const Acc* pv) {
     constexpr int R = 8, W = 16;
     __m256i       r[R];
     __m256i       ps = WithPsqt ? _mm256_loadu_si256((const __m256i*)entry.psqt) : _mm256_setzero_si256();
@@ -2168,21 +2167,31 @@ inline void refresh_tile(const RowList& LH, const RowList& LO, Acc& entry, Acc& 
     for (int k = 0; k < R; k++) _mm256_storeu_si256((__m256i*)(entry.v + t + k * W), r[k]);
     if (WithPsqt) _mm256_storeu_si256((__m256i*)entry.psqt, ps);
     rows8_256<R, WithPsqt>(LO, r, ps, t);   // added int8 rows only (the board's)
+    if (pv) {
+        for (int k = 0; k < R; k++) r[k] = _mm256_add_epi16(r[k], _mm256_load_si256((const __m256i*)(pv->v + t + k * W)));
+        if (WithPsqt) ps = _mm256_add_epi32(ps, _mm256_load_si256((const __m256i*)pv->psqt));
+    }
     for (int k = 0; k < R; k++) _mm256_storeu_si256((__m256i*)(dst.v + t + k * W), r[k]);
     if (WithPsqt) _mm256_storeu_si256((__m256i*)dst.psqt, ps);
 }
 
-void apply_refresh(const RowList& LH, const RowList& LO, Acc& entry, Acc& dst) {
+void apply_refresh(const RowList& LH, const RowList& LO, Acc& entry, Acc& dst, const Acc* pv = nullptr) {
     CN_TIME(1);
     constexpr int TILE = 8 * 16;
-    refresh_tile<true>(LH, LO, entry, dst, 0);
-    for (int t = TILE; t < L1; t += TILE) refresh_tile<false>(LH, LO, entry, dst, t);
+    refresh_tile<true>(LH, LO, entry, dst, 0, pv);
+    for (int t = TILE; t < L1; t += TILE) refresh_tile<false>(LH, LO, entry, dst, t, pv);
 }
+#define CN_PAWN_CACHE 1
 #else
-void apply_refresh(const RowList& LH, const RowList& LO, Acc& entry, Acc& dst) {
+void apply_refresh(const RowList& LH, const RowList& LO, Acc& entry, Acc& dst, const Acc* pv = nullptr) {
     apply(LH, entry, entry);
     apply(LO, entry, dst);
+    if (pv) {
+        for (int j = 0; j < L1; j++) dst.v[j] += pv->v[j];
+        for (int b = 0; b < NBUCKETS; b++) dst.psqt[b] += pv->psqt[b];
+    }
 }
+#define CN_PAWN_CACHE 1
 #endif
 
 
@@ -2251,7 +2260,7 @@ void apply_kingstep(const RowList& LP, const RowList& LN, const RowList& LO, con
     kingstep_tile<true>(LP, LN, LO, sPar, ePar, eNew, dst, 0);
     for (int t = 8 * 32; t < L1; t += 8 * 32) kingstep_tile<false>(LP, LN, LO, sPar, ePar, eNew, dst, t);
 }
-#elif defined(USE_AVX2) && defined(CN_AVX2_FUSED)
+#elif defined(USE_AVX2) && !defined(CN_NO_AVX2_FUSED)
 // CN_AVX2_FUSED (see apply_refresh): with 16 registers only one accumulator tile is live, so S(parent) - parent entry
 // waits in dst (stored, then read back from L1) while the child's entry is brought to the board. The order of the
 // steps is the AVX-512 one: the child's entry is read after the parent's was written.
@@ -2317,7 +2326,7 @@ void move_rows_all(const NnStack& S, int i, const Persp& P, RowList& L, int dir)
 
 }  // namespace
 
-Out evaluate(const Net& net, Handle& h, const Board& b) {
+Out evaluate(const Net& net, Handle& h, const Board& b, bool want_x1) {
     CN_TIME(0);
     {   // The pawn-king entry is read at the end: asked for now, so it arrives under the accumulator work (21/10/2026).
         const char* e = reinterpret_cast<const char*>(&h.pkc[pk_index(b)]);
@@ -2356,11 +2365,11 @@ Out evaluate(const Net& net, Handle& h, const Board& b) {
         const Persp*   PP[2] = {&P0, &P1};
         RowList* const LL[2] = {L0, L1};
         move_rows_h(S, top, P0, *L0, 1);
-        move_rows_h(S, top, P1, *L1, 1);
         move_threats(S, top, PP, LL, 1);
         move_pawns(S, top, P0, *L0, 1);
-        move_pawns(S, top, P1, *L1, 1);
         apply(*L0, h.acc[top - 1][0], h.acc[top][0]);
+        move_rows_h(S, top, P1, *L1, 1);
+        move_pawns(S, top, P1, *L1, 1);
         apply(*L1, h.acc[top - 1][1], h.acc[top][1]);
         S.st[top].computed[0] |= 1;
         S.st[top].computed[1] |= 1;
@@ -2438,7 +2447,7 @@ Out evaluate(const Net& net, Handle& h, const Board& b) {
         }
     }
     const std::int32_t* pk = pawn_king(net, h, b);
-    return CN_FORWARD(net, h.acc[top][b.stm], h.acc[top][b.stm ^ 1], bucket_of(b), pk, h.x1);   // x1 kept: pk_effect
+    return CN_FORWARD(net, h.acc[top][b.stm], h.acc[top][b.stm ^ 1], bucket_of(b), pk, want_x1 ? h.x1 : nullptr);
 }
 
 // --- C2 signals (agent B) ---
@@ -2513,7 +2522,7 @@ const std::int32_t* pk_outputs(const Net& net, Handle& h, const Board& b) { retu
 namespace {
 inline int tail_positional(const Stack& st, const std::int32_t* x1, const Acc& any, int bucket) {
 #if defined(USE_AVX512)
-    return forward_tail_simd(st, x1, any, any, bucket).positional;
+    return forward_tail_simd(st, _mm512_loadu_si512(x1), _mm512_loadu_si512(x1 + 16), any, any, bucket).positional;
 #elif defined(USE_AVX2)
     __m256i r[4];
     for (int k = 0; k < 4; k++) r[k] = _mm256_loadu_si256((const __m256i*)(x1 + 8 * k));
